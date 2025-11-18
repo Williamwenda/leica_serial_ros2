@@ -54,7 +54,10 @@ ament_target_dependencies(leica_serial_node
 # Install targets
 install(TARGETS
   leica_interface
-  DESTINATION lib/${PROJECT_NAME}
+  EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
 )
 
 install(TARGETS
@@ -77,5 +80,15 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()
+
+# Export targets
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_dependencies(
+  rclcpp
+  std_msgs
+  geometry_msgs
+  tf2
+  tf2_ros
+)
 
 ament_package()

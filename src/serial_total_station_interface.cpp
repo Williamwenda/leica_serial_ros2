@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <chrono>
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/asio/serial_port_base.hpp>
@@ -48,6 +49,11 @@ void SerialTSInterface::connect(std::string comport) {
     std::cout << "get into the connect function" << std::endl;
 
     serial_port_.open(comport, ec);
+    if (ec) {
+      std::cerr << "Failed to open serial port: " << ec.message() << std::endl;
+      return;
+    }
+    
     serial_port_.set_option(BAUD);
     serial_port_.set_option(C_SIZE);
     serial_port_.set_option(FLOW);
@@ -56,11 +62,34 @@ void SerialTSInterface::connect(std::string comport) {
     std::cout << "finished setting up" << std::endl;
 
     if (!ec) {
+      std::cout << "Starting reader..." << std::endl;
       startReader();
+      std::cout << "Reader started successfully" << std::endl;
     }
 
     // Start io_context in separate thread
-    contextThread_ = std::thread([this](){ io_context_->run(); });
+    std::cout << "Starting io_context thread..." << std::endl;
+    contextThread_ = std::thread([this](){ 
+      try {
+        std::cout << "io_context thread started, running..." << std::endl;
+        io_context_->run(); 
+        std::cout << "io_context thread finished" << std::endl;
+      } catch (const std::exception& e) {
+        std::cerr << "Exception in io_context thread: " << e.what() << std::endl;
+      }
+    });
+    std::cout << "io_context thread created successfully" << std::endl;
+    
+    // Schedule automatic start using a timer to avoid race conditions
+    if (!ec) {
+      auto startTimer = std::make_shared<boost::asio::deadline_timer>(*io_context_, boost::posix_time::milliseconds(1000));
+      startTimer->async_wait([this, startTimer](const boost::system::error_code& timer_ec) {
+        if (!timer_ec) {
+          std::cout << "Starting total station measurements automatically..." << std::endl;
+          start();
+        }
+      });
+    }
   } catch (std::exception& e) {
     std::cerr << "Exception: " << e.what() << "\n";
   }
@@ -109,7 +138,13 @@ void SerialTSInterface::readHandler(const boost::system::error_code& ec,
     // std::cout << data << std::endl;
 
     // Check for responses if the total station searches the prism
-    if (searchingPrismFlag_) {
+    bool searching = false;
+    {
+      std::lock_guard<std::mutex> guard(searchingPrismMutex_);
+      searching = searchingPrismFlag_;
+    }
+
+    if (searching) {
       // Catch the response
       if (data.find("%R8P,0,0:") != std::string::npos) {
         std::cout << "Got an answer." << std::endl;
@@ -129,26 +164,37 @@ void SerialTSInterface::readHandler(const boost::system::error_code& ec,
             messagesReceivedFlag_ = true;
           }
         }
+      } else if (!data.empty() && data[0] == 'T') {
+        // Total station resumed streaming while search flag is active
+        std::cout << "Prism stream resumed while searching." << std::endl;
+        std::lock_guard<std::mutex> guard(searchingPrismMutex_);
+        searchingPrismFlag_ = false;
       }
-    } else if (data[0] == 'T') { // Forward x, y and z coordinate if location was received
+    }
+
+    if (!data.empty() && data[0] == 'T') { // Forward x, y and z coordinate if location was received
       // Split the received message to access the coordinates
       std::vector<std::string> results;
       boost::split(results, data, [](char c){return c == ',';});
 
-      double x = std::stod(results[2]);  // east axis
-      double y = std::stod(results[1]);  // north axis
-      double z = std::stod(results[3]);
+      if (results.size() >= 4) {
+        double x = std::stod(results[2]);  // east axis
+        double y = std::stod(results[1]);  // north axis
+        double z = std::stod(results[3]);
 
-      locationCallback_(x, y, z);
+        locationCallback_(x, y, z);
 
-      // Indicate that a message was received
-      std::lock_guard<std::mutex> guard(messageReceivedMutex_);
-      messagesReceivedFlag_ = true;
+        // Indicate that a message was received
+        std::lock_guard<std::mutex> guard(messageReceivedMutex_);
+        messagesReceivedFlag_ = true;
 
-      // Start timer if it is not yet started
-      if (!timerStartedFlag_) {
-        startTimer();
-        timerStartedFlag_ = true;
+        // Start timer if it is not yet started
+        if (!timerStartedFlag_) {
+          startTimer();
+          timerStartedFlag_ = true;
+        }
+      } else {
+        std::cerr << "Malformed coordinate message: " << data << std::endl;
       }
     }
 
@@ -165,7 +211,10 @@ void SerialTSInterface::readHandler(const boost::system::error_code& ec,
 }
 
 void SerialTSInterface::searchPrism(void) {
-  searchingPrismFlag_ = true;
+  {
+    std::lock_guard<std::mutex> guard(searchingPrismMutex_);
+    searchingPrismFlag_ = true;
+  }
   std::vector<char> command {'%', 'R', '8', 'Q', ',', '6', ':', '1', 0x0d/*CR*/, 0x0a/*LF*/};
   write(command);
 

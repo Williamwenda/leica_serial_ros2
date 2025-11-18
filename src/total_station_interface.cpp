@@ -18,6 +18,7 @@ TSInterface::TSInterface(std::function<void(const double, const double, const do
     io_context_(new boost::asio::io_service()),
     timerStartedFlag_(false),
     timer_(*io_context_, boost::posix_time::seconds(2)),
+    messagesReceivedFlag_(false),
     searchingPrismFlag_(false),
     externalPositionReceivedFlag_(false),
     locationCallback_(locationCallback)
@@ -99,7 +100,10 @@ void TSInterface::timerHandler() {
 }
 
 void TSInterface::searchPrism(void) {
-  searchingPrismFlag_ = true;
+  {
+    std::lock_guard<std::mutex> guard(searchingPrismMutex_);
+    searchingPrismFlag_ = true;
+  }
   std::vector<char> command {'%', 'R', '8', 'Q', ',', '6', ':', '1', 0x0d/*CR*/, 0x0a/*LF*/};
   write(command);
 
@@ -107,7 +111,10 @@ void TSInterface::searchPrism(void) {
 }
 
 void TSInterface::turnTelescope(void) {
-  searchingPrismFlag_ = true;
+  {
+    std::lock_guard<std::mutex> guard(searchingPrismMutex_);
+    searchingPrismFlag_ = true;
+  }
   std::vector<char> command {'%', 'R', '8', 'Q', ',', '7', ':', '1'};
   std::string y = boost::lexical_cast<std::string>(prismPosition_[1]);
   for (char c : y) {
