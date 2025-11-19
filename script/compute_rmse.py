@@ -22,6 +22,12 @@ import matplotlib.pyplot as plt
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
+# ANSI colors
+GREEN_BOLD = "\033[1;32m"
+BLUE = "\033[34m"
+RESET = "\033[0m"
+
+
 # ================================================================
 # Bag reading
 # ================================================================
@@ -89,7 +95,7 @@ def read_mcap_bag(bag_path, topic_name="/leica/position"):
             sys.exit(1)
 
         mcap_file = mcap_files[0]
-        print(f"Reading from MCAP file: {mcap_file}")
+        # print(f"Reading from MCAP file: {mcap_file}")
 
         for msg in read_ros2_messages(str(mcap_file)):
             if msg.channel.topic == topic_name:
@@ -104,7 +110,7 @@ def read_mcap_bag(bag_path, topic_name="/leica/position"):
 
     elif db_files:
         db_file = db_files[0]
-        print(f"Reading from DB3 file: {db_file}")
+        # print(f"Reading from DB3 file: {db_file}")
 
         conn = sqlite3.connect(str(db_file))
         cursor = conn.cursor()
@@ -225,42 +231,106 @@ def extract_segment(time, pos, start_idx, end_idx):
     seg_p = pos[start_idx:end_idx]
     return seg_t, seg_p
 
-
-def compute_rmse_time_synced(t1, p1, t2, p2):
+def compute_rmse_by_arclength(p1, p2, n_grid=None):
     """
-    Compute RMSE between two 3D trajectories, time-aligned.
-
-    - Time axes t1, t2 start at 0 (assumed).
-    - Interpolate both onto a common grid [0, min(T1, T2)].
+    Compute RMSE between two 3D trajectories, aligned by arc length (path distance).
 
     Returns:
-        rmse_total, rmse_x, rmse_y, rmse_z
+        rmse_total, rmse_x, rmse_y, rmse_z, rmse_lateral
+        - rmse_total: 3D Euclidean RMSE (what you had before)
+        - rmse_x/y/z: component-wise RMSE in world frame
+        - rmse_lateral: RMSE of cross-track (perpendicular) error only
     """
-    if len(t1) < 2 or len(t2) < 2:
-        return np.nan, np.nan, np.nan, np.nan
+    if len(p1) < 2 or len(p2) < 2:
+        return np.nan, np.nan, np.nan, np.nan, np.nan
 
-    T = min(t1[-1], t2[-1])  # common duration
-    # use number of samples ~ min(len1,len2) for the grid
-    n_grid = min(len(t1), len(t2))
-    t_common = np.linspace(0.0, T, n_grid)
+    # ---- 1) cumulative arclength ----
+    def cumulative_arclength(p):
+        diffs = np.diff(p, axis=0)
+        seg_lengths = np.linalg.norm(diffs, axis=1)
+        s = np.zeros(len(p))
+        s[1:] = np.cumsum(seg_lengths)
+        return s
 
+    s1 = cumulative_arclength(p1)
+    s2 = cumulative_arclength(p2)
+    L1, L2 = s1[-1], s2[-1]
+
+    if L1 <= 0 or L2 <= 0:
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+
+    # ---- 2) common arclength grid ----
+    L_common = min(L1, L2)
+    if n_grid is None:
+        n_grid = min(len(p1), len(p2))
+    n_grid = max(n_grid, 10)  # safety
+
+    s_common = np.linspace(0.0, L_common, n_grid)
+
+    # ---- 3) interpolate positions vs arclength ----
     p1_interp = np.zeros((n_grid, 3))
     p2_interp = np.zeros((n_grid, 3))
 
     for k in range(3):
-        p1_interp[:, k] = np.interp(t_common, t1, p1[:, k])
-        p2_interp[:, k] = np.interp(t_common, t2, p2[:, k])
+        p1_interp[:, k] = np.interp(s_common, s1, p1[:, k])
+        p2_interp[:, k] = np.interp(s_common, s2, p2[:, k])
 
+    # ---- 4) standard 3D RMSE (what you already had) ----
     diff = p1_interp - p2_interp
     rmse_x = np.sqrt(np.mean(diff[:, 0] ** 2))
     rmse_y = np.sqrt(np.mean(diff[:, 1] ** 2))
     rmse_z = np.sqrt(np.mean(diff[:, 2] ** 2))
     rmse   = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
-    return rmse, rmse_x, rmse_y, rmse_z
+
+    # ---- 5) lateral (cross-track) RMSE ----
+    # approximate tangent of teach path w.r.t. s
+    tangents = np.zeros_like(p1_interp)
+    # central differences for interior points
+    tangents[1:-1] = p1_interp[2:] - p1_interp[:-2]
+    # forward/backward for endpoints
+    tangents[0] = p1_interp[1] - p1_interp[0]
+    tangents[-1] = p1_interp[-1] - p1_interp[-2]
+
+    # normalize tangents
+    tang_norm = np.linalg.norm(tangents, axis=1, keepdims=True)
+    # avoid divide-by-zero
+    tang_norm[tang_norm == 0] = 1.0
+    t_hat = tangents / tang_norm
+
+    # project diff onto tangent and subtract to get lateral component
+    # diff_parallel = (diff · t_hat) t_hat
+    proj = np.sum(diff * t_hat, axis=1, keepdims=True)
+    diff_parallel = proj * t_hat
+    diff_lateral = diff - diff_parallel
+
+    lateral_dist = np.linalg.norm(diff_lateral, axis=1)
+    rmse_lateral = np.sqrt(np.mean(lateral_dist ** 2))
+
+    return rmse, rmse_x, rmse_y, rmse_z, rmse_lateral
 
 # ================================================================
 # Plotting
 # ================================================================
+
+def set_axes_equal(ax):
+    """Make axes of 3D plot have equal scale."""
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    z_limits = ax.get_zlim3d()
+
+    x_range = abs(x_limits[1] - x_limits[0])
+    y_range = abs(y_limits[1] - y_limits[0])
+    z_range = abs(z_limits[1] - z_limits[0])
+
+    max_range = max([x_range, y_range, z_range])
+
+    mid_x = (x_limits[0] + x_limits[1]) / 2
+    mid_y = (y_limits[0] + y_limits[1]) / 2
+    mid_z = (z_limits[0] + z_limits[1]) / 2
+
+    ax.set_xlim3d([mid_x - max_range/2, mid_x + max_range/2])
+    ax.set_ylim3d([mid_y - max_range/2, mid_y + max_range/2])
+    ax.set_zlim3d([mid_z - max_range/2, mid_z + max_range/2])
 
 def plot_3d_trajectory(teach_pos, repeat_pos, teach_moving, repeat_moving):
     fig = plt.figure(figsize=(10, 8))
@@ -297,6 +367,9 @@ def plot_3d_trajectory(teach_pos, repeat_pos, teach_moving, repeat_moving):
     ax.set_title("3D Trajectory Comparison")
     ax.legend()
     ax.grid(True)
+
+    set_axes_equal(ax)
+
     return fig
 
 
@@ -354,52 +427,48 @@ def main():
         print("Usage: compute_rmse.py <teach_bag_path> <repeat_bag_path>")
         sys.exit(1)
 
-    print("=" * 60)
-    print("ROS2 Bag Analysis: Teach vs Repeat Trajectories")
+    print("Total Station GT: Teach vs Repeat Trajectories")
     print("=" * 60)
 
     # 1) read data
-    print("\n1. Reading data from bags...")
+    # print("\n1. Reading data from bags...")
     teach_time, teach_pos = read_mcap_bag(teach_bag)
     repeat_time, repeat_pos = read_mcap_bag(repeat_bag)
 
-    print(f"   Teach:  {len(teach_pos)} points")
-    print(f"   Repeat: {len(repeat_pos)} points")
+    ### ------ Disable print-outs
+    # print(f"   Teach:  {len(teach_pos)} points")
+    # print(f"   Repeat: {len(repeat_pos)} points")
 
     # 2) moving sequence detection
-    print("\n2. Detecting moving sequences (first static run / last static run)...")
+    # print("\n2. Detecting moving sequences (first static run / last static run)...")
     teach_start, teach_end = detect_moving_sequence(teach_pos)
     repeat_start, repeat_end = detect_moving_sequence(repeat_pos)
 
-    print(f"   Teach idx:  {teach_start} -> {teach_end} "
-          f"({teach_end - teach_start} samples)")
-    print(f"   Repeat idx: {repeat_start} -> {repeat_end} "
-          f"({repeat_end - repeat_start} samples)")
-    print(f"   Teach time:  {teach_time[teach_start]:.3f}s -> {teach_time[teach_end-1]:.3f}s")
-    print(f"   Repeat time: {repeat_time[repeat_start]:.3f}s -> {repeat_time[repeat_end-1]:.3f}s")
+    # print(f"   Teach idx:  {teach_start} -> {teach_end} "
+    #       f"({teach_end - teach_start} samples)")
+    # print(f"   Repeat idx: {repeat_start} -> {repeat_end} "
+    #       f"({repeat_end - repeat_start} samples)")
+    # print(f"   Teach time:  {teach_time[teach_start]:.3f}s -> {teach_time[teach_end-1]:.3f}s")
+    # print(f"   Repeat time: {repeat_time[repeat_start]:.3f}s -> {repeat_time[repeat_end-1]:.3f}s")
 
     # segments (for RMSE)
     teach_t_seg, teach_p_seg = extract_segment(teach_time, teach_pos, teach_start, teach_end)
     repeat_t_seg, repeat_p_seg = extract_segment(repeat_time, repeat_pos, repeat_start, repeat_end)
 
-    # 3) RMSE (time-aligned)
-    print("\n3. Computing time-aligned RMSE on moving sequences...")
-    rmse, rmse_x, rmse_y, rmse_z = compute_rmse_time_synced(
-        teach_t_seg, teach_p_seg, repeat_t_seg, repeat_p_seg
+    # 3) RMSE (spatially-aligned)
+
+    rmse, rmse_x, rmse_y, rmse_z, rmse_lat = compute_rmse_by_arclength(
+         teach_p_seg, repeat_p_seg
     )
-    print(f"   Overall RMSE: {rmse:.6f} m")
-    print(f"   RMSE X:       {rmse_x:.6f} m")
-    print(f"   RMSE Y:       {rmse_y:.6f} m")
-    print(f"   RMSE Z:       {rmse_z:.6f} m")
+
+    print(f"{GREEN_BOLD}   RMSE lateral: {rmse_lat:.6f} m{RESET}")
 
     # 4) plots
-    print("\n4. Creating plots...")
     plot_3d_trajectory(teach_pos, repeat_pos, (teach_start, teach_end),
                        (repeat_start, repeat_end))
     plot_xyz_vs_time(teach_time, teach_pos, repeat_time, repeat_pos,
                      (teach_start, teach_end), (repeat_start, repeat_end))
 
-    print("\nDone. Close the plot windows to exit.")
     plt.show()
 
 
