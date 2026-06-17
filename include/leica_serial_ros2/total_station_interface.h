@@ -77,6 +77,7 @@ class TSInterface {
   bool timerStartedFlag_;                                 /**< Flag indicating if the timer started or not */
   boost::asio::deadline_timer timer_;                     /**< Deadline timer */
   bool messagesReceivedFlag_;                             /**< Flag indicating if a message was received */
+  int missedMessageCount_;                                /**< Consecutive watchdog intervals without a message */
   std::mutex messageReceivedMutex_;                       /**< Mutex for the corresponding flag */
 
   bool searchingPrismFlag_;                               /**< Flag indicating that the total station searches the prism */

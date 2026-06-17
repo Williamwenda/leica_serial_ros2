@@ -6,6 +6,7 @@
  */
 
 #include <iostream>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -107,12 +108,13 @@ void SerialTSInterface::startReader() {
 }
 
 void SerialTSInterface::write(std::vector<char> command) {
+  auto command_buffer = std::make_shared<std::vector<char>>(std::move(command));
   boost::asio::async_write(serial_port_,
-                           boost::asio::buffer(command),
-                           std::bind(&SerialTSInterface::writeHandler,
-                                     this,
-                                     std::placeholders::_1,
-                                     std::placeholders::_2)
+                           boost::asio::buffer(*command_buffer),
+                           [this, command_buffer](const boost::system::error_code& ec,
+                                                  std::size_t bytes_transferred) {
+                             writeHandler(ec, bytes_transferred);
+                           }
                           );
 }
 
@@ -127,12 +129,14 @@ void SerialTSInterface::readHandler(const boost::system::error_code& ec,
                               std::size_t bytes_transferred) {
 
   if (!ec) {
-    // Convert streambuf to std::string
+    // Convert exactly the completed line. readData_ can already contain bytes
+    // from later messages after async_read_until returns.
     boost::asio::streambuf::const_buffers_type bufs = readData_.data();
     std::string data(boost::asio::buffers_begin(bufs),
-                     boost::asio::buffers_begin(bufs) + readData_.size());
+                     boost::asio::buffers_begin(bufs) + bytes_transferred);
 
     readData_.consume(bytes_transferred);
+    boost::trim(data);
 
     // Print received message
     // std::cout << data << std::endl;
@@ -178,9 +182,21 @@ void SerialTSInterface::readHandler(const boost::system::error_code& ec,
       boost::split(results, data, [](char c){return c == ',';});
 
       if (results.size() >= 4) {
-        double x = std::stod(results[2]);  // east axis
-        double y = std::stod(results[1]);  // north axis
-        double z = std::stod(results[3]);
+        char* end = nullptr;
+        const double y = std::strtod(results[1].c_str(), &end);  // north axis
+        const bool valid_y = end != results[1].c_str();
+        end = nullptr;
+        const double x = std::strtod(results[2].c_str(), &end);  // east axis
+        const bool valid_x = end != results[2].c_str();
+        end = nullptr;
+        const double z = std::strtod(results[3].c_str(), &end);
+        const bool valid_z = end != results[3].c_str();
+
+        if (!valid_x || !valid_y || !valid_z) {
+          std::cerr << "Malformed coordinate message: " << data << std::endl;
+          startReader();
+          return;
+        }
 
         locationCallback_(x, y, z);
 
